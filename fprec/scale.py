@@ -118,15 +118,19 @@ def scale_from_printed_areas(pairs: Sequence[Tuple[float, float]]) -> Optional[S
 
 
 def printed_area_tokens(tokens: Sequence[Token], min_m2=1.0, max_m2=300.0):
-    """从 OCR token 里挑出形如 11.2 / 3.9m² 的面积标注。"""
+    """从 OCR token 里挑出形如 11.2 / 3.9m² 的面积标注。
+
+    必须带一位小数：家具纹理、水印和尺寸数字经常被 OCR 成裸整数，
+    把它们当面积会让同一房间的面积求和严重失真。
+    """
     out = []
     for t in tokens:
         txt = t.text.strip().replace(" ", "")
         m = _AREA_RE.match(txt)
-        if not m:
+        if not m or not m.group(2):
             continue
         whole, frac = m.group(1), m.group(2)
-        val = float(whole + ("." + frac if frac else ""))
+        val = float(whole + "." + frac)
         if not (min_m2 <= val <= max_m2):
             continue
         out.append((val, t))

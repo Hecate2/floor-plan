@@ -7,7 +7,7 @@ class Params:
     # --- 线稿/墙体提取 ---
     wall_gray: int = 70          # 墙体（实心深色）灰度阈值
     line_gray: int = 150         # 细线（窗、门弧、家具轮廓）灰度阈值
-    wall_open_ksize: int = 5     # 形态学开运算核：删掉比墙薄的细线/文字
+    wall_open_ksize: int = 3     # 形态学开运算核：去掉 1-2px 细线，同时保留低清图的 3-4px 墙
     min_wall_area: int = 60      # 墙体连通域最小面积(px)
     min_wall_len: int = 12       # 矩形分解后最小边长(px)
 

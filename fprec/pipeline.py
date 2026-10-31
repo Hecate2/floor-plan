@@ -20,7 +20,8 @@ from .scale import (ScaleResult, printed_area_tokens, scale_from_chains,
                     scale_from_printed_areas)
 from .structure import (RoomBlob, _propagate, add_bridges, build_blobs,
                         candidate_gaps, classify_openings, estimate_door_px,
-                        footprint, merge_fragments, orthogonalize, segment_rooms)
+                        footprint, full_wall_window_gaps, merge_fragments,
+                        orthogonalize, segment_rooms)
 from .text import Token, ocr_with_rotation
 from .viz import render_overlay, to_svg
 
@@ -205,7 +206,9 @@ def _analyze(bgr: np.ndarray, p: Params, hints: Optional[dict], use_ocr: bool,
     # --- 3. 轮廓 + 洞口 ---
     cands = candidate_gaps(segs, p)
     fp = footprint(add_bridges(ink, cands), grow=10)
-    openings = classify_openings(cands, fp, ink, p, mm_per_px=s)
+    opening_cands = cands + full_wall_window_gaps(ink, wall, segs, fp, cands, p)
+    openings = classify_openings(opening_cands, fp, ink, p, mm_per_px=s)
+    room_openings = classify_openings(cands, fp, ink, p, mm_per_px=s)
 
     # --- 4. 房间 ---
     # 种子阶段用"全部候选缺口"封堵（比成品洞口更宽松），避免宽窗洞把两个房间连起来
@@ -221,7 +224,7 @@ def _analyze(bgr: np.ndarray, p: Params, hints: Optional[dict], use_ocr: bool,
                        for t in name_tokens)
         near = cv2.dilate(b.mask, np.ones((5, 5), np.uint8))
         has_open = False
-        for o in openings:
+        for o in room_openings:
             x0, y0, x1, y1 = o.rect()
             cx, cy = int((x0 + x1) / 2), int((y0 + y1) / 2)
             if 0 <= cy < near.shape[0] and 0 <= cx < near.shape[1] and near[cy, cx]:
@@ -251,17 +254,21 @@ def _analyze(bgr: np.ndarray, p: Params, hints: Optional[dict], use_ocr: bool,
             alt = scale_from_printed_areas(pairs)
             if alt:
                 sr, s = alt, alt.mm_per_px
+    # 标注面积可能替换比例尺，门宽/窗宽与类别必须使用最终比例尺。
+    openings = classify_openings(opening_cands, fp, ink, p, mm_per_px=s)
     if sr.method == "default_wall":
         warnings.append("未能从图中读出比例尺，使用墙厚经验值（误差可能 >30%）")
-    if hints:
-        hints["_s"] = s
+    label_hints = dict(hints) if hints else None
+    if label_hints is not None:
+        label_hints["_s"] = s
 
     # --- 5. 房间语义 ---
-    info = _assign_labels(blobs, tokens, hints)
+    info = _assign_labels(blobs, tokens, label_hints)
     # 欠分割纠正：一块区域里读出多个房名时，用这些房名做种子重新切一刀（墙/线仍能阻挡生长）
     if split_by_labels:
         blobs, info = _split_multi_label_rooms(blobs, info, ink, p, warnings)
-    # 拆分后房间索引变了，重新把标注面积挂到对应房间
+    # 拆分后房间索引变了，重新挂 OCR 面积；没有 OCR 面积时保留 hint 面积。
+    hint_areas = {i: d.get("area") for i, d in info.items() if d.get("area") is not None}
     for i in info:
         info[i]["area"] = None
     cand: Dict[int, List[float]] = {}
@@ -282,6 +289,9 @@ def _analyze(bgr: np.ndarray, p: Params, hints: Optional[dict], use_ocr: bool,
     for i, val in printed_by_room.items():
         if info.get(i, {}).get("area") is None:
             info.setdefault(i, {"label": None, "area": None})["area"] = val
+    for i, val in hint_areas.items():
+        if info.get(i, {}).get("area") is None:
+            info[i]["area"] = val
 
     # --- 6. 组装毫米级模型 ---
     xs = [0]; ys = [0]
@@ -335,8 +345,9 @@ def _analyze(bgr: np.ndarray, p: Params, hints: Optional[dict], use_ocr: bool,
         else:
             a_px, b_px = (o.line, o.s0), (o.line, o.s1)
         width_mm = o.width * s
-        height = p.door_height_mm if o.type == "door" else p.window_head_mm
-        sill = 0.0 if o.type == "door" else p.window_sill_mm
+        is_window = o.type == "window"
+        height = (p.window_head_mm - p.window_sill_mm) if is_window else p.door_height_mm
+        sill = p.window_sill_mm if is_window else 0.0
         openings_mm.append(MOpening(
             id=f"O{i + 1}", type=o.type, host_wall=nearest_wall(o.center),
             a=to_mm(a_px), b=to_mm(b_px), width=round(width_mm, 0),
@@ -403,11 +414,14 @@ def _analyze(bgr: np.ndarray, p: Params, hints: Optional[dict], use_ocr: bool,
     if not openings:
         warnings.append("未检测到门窗洞口")
 
+    contours, _ = cv2.findContours(fp, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    outline = []
+    if contours:
+        outline = [to_mm(pt) for pt in cv2.approxPolyDP(
+            max(contours, key=cv2.contourArea), 3, True).reshape(-1, 2)]
     level = Level(id=level_id, name=level_name, wall_height_mm=p.wall_height_mm,
                   walls=walls_mm, openings=openings_mm, rooms=rooms_mm,
-                  outline=[to_mm(pt) for pt in cv2.approxPolyDP(
-                      max(cv2.findContours(fp, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)[0],
-                          key=cv2.contourArea), 3, True).reshape(-1, 2)])
+                  outline=outline)
     stats = {
         "rooms": len(rooms_mm), "walls": len(walls_mm), "openings": len(openings_mm),
         "wall_px": int(wall.sum()), "segments": len(segs), "ocr_tokens": len(tokens),
@@ -421,7 +435,7 @@ def _analyze(bgr: np.ndarray, p: Params, hints: Optional[dict], use_ocr: bool,
 
 
 def detect_plans(gray: np.ndarray, p: Params, min_side: int = 180,
-                 min_area_frac: float = 0.02) -> List[Tuple[int, int, int, int]]:
+                 min_area_frac: float = 0.005) -> List[Tuple[int, int, int, int]]:
     """一张图上可能并排放着几个平面（如"1F / 2F"）。用墙体聚成块来切。
 
     只看墙体不看墨线：尺寸链是细线，不会被误当成一块平面。
@@ -448,8 +462,8 @@ def detect_plans(gray: np.ndarray, p: Params, min_side: int = 180,
         return [(0, 0, W, H)]
     boxes.sort(key=lambda b: b[0])
     merged = [boxes[0]]
-    for b in boxes[1:]:                     # 合并重叠框
-        if b[0] < merged[-1][2] - 10:
+    for b in boxes[1:]:                     # 合并重叠或仅有裁切缝隙的框
+        if b[0] <= merged[-1][2] + 24:
             merged[-1] = [min(merged[-1][0], b[0]), min(merged[-1][1], b[1]),
                           max(merged[-1][2], b[2]), max(merged[-1][3], b[3])]
         else:

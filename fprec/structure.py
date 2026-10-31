@@ -60,39 +60,172 @@ def candidate_gaps(segs: List[Seg], p) -> List[Opening]:
                 continue
             ops.append(Opening("opening", orient, line, int(a.e1), int(b.e0),
                                float((a.t + b.t) / 2), 0.3))
-    return ops
+
+    # 相邻墙段可能隔着一段 T 形墙。先在实际交叉点拆开，避免两个门洞
+    # 被合成一个超宽 opening，也让每个洞口的宽度恢复为真实值。
+    split: List[Opening] = []
+    for o in ops:
+        cuts = []
+        for s in segs:
+            if s.orient == o.orient or not (o.s0 < s.line < o.s1):
+                continue
+            if s.e0 - p.snap_tol_px <= o.line <= s.e1 + p.snap_tol_px:
+                cuts.append(s)
+        cursor = o.s0
+        for s in sorted(cuts, key=lambda v: v.line):
+            end = int(np.floor(s.line - s.t / 2))
+            if p.min_opening_px <= end - cursor <= p.max_opening_px:
+                split.append(Opening("opening", o.orient, o.line, cursor, end,
+                                     o.thickness, o.confidence))
+            cursor = int(np.ceil(s.line + s.t / 2))
+        if p.min_opening_px <= o.s1 - cursor <= p.max_opening_px:
+            split.append(Opening("opening", o.orient, o.line, cursor, o.s1,
+                                 o.thickness, o.confidence))
+    return split
+
+
+def _opening_band(ink: np.ndarray, o: Opening, radius: int) -> np.ndarray:
+    if o.orient == "h":
+        return ink[max(0, o.line - radius):o.line + radius + 1, o.s0:o.s1]
+    return ink[o.s0:o.s1, max(0, o.line - radius):o.line + radius + 1]
+
+
+def _parallel_line_clusters(band: np.ndarray, orient: str) -> int:
+    """贯穿洞口且彼此分离的平行线数量；相邻像素属于同一条线。"""
+    if not band.size:
+        return 0
+    axis = 1 if orient == "h" else 0
+    profile = band.mean(axis=axis)
+    indices = np.flatnonzero(profile >= 0.45)
+    if not indices.size:
+        return 0
+    return int(1 + np.sum(np.diff(indices) > 1))
+
+
+def full_wall_window_gaps(ink: np.ndarray, wall: np.ndarray, segs: List[Seg],
+                          fp: np.ndarray, existing: List[Opening], p) -> List[Opening]:
+    """补充整面墙都是窗、两侧没有墙段可配对的直线窗。"""
+    if not segs or not fp.any():
+        return []
+    min_len = max(8, p.min_opening_px)
+    thin = ((ink > 0) & (cv2.dilate(wall, np.ones((3, 3), np.uint8)) == 0)).astype(np.uint8)
+    lines = cv2.HoughLinesP(thin * 255, 1, np.pi / 180, threshold=min_len,
+                            minLineLength=min_len, maxLineGap=2)
+    if lines is None:
+        return []
+
+    runs = []
+    for x0, y0, x1, y1 in lines.reshape(-1, 4):
+        dx, dy = int(x1 - x0), int(y1 - y0)
+        if abs(dy) <= 1 and abs(dx) >= min_len:
+            runs.append(("h", float((y0 + y1) / 2), min(x0, x1), max(x0, x1)))
+        elif abs(dx) <= 1 and abs(dy) >= min_len:
+            runs.append(("v", float((x0 + x1) / 2), min(y0, y1), max(y0, y1)))
+    med_t = float(np.median([s.t for s in segs]))
+    distance = cv2.distanceTransform((fp > 0).astype(np.uint8), cv2.DIST_L2, 5)
+    raw: List[Opening] = []
+
+    def overlaps(a: Opening, b: Opening) -> bool:
+        # 同一窗的玻璃线、墙中线和凸窗外框可能相隔数倍墙厚。
+        if a.orient != b.orient or abs(a.line - b.line) > max(4.0, 4 * max(a.thickness, b.thickness)):
+            return False
+        overlap = max(0, min(a.s1, b.s1) - max(a.s0, b.s0))
+        return overlap > 0.5 * min(a.width, b.width)
+
+    for i, a in enumerate(runs):
+        for b in runs[i + 1:]:
+            if a[0] != b[0]:
+                continue
+            orient, la, a0, a1 = a
+            _, lb, b0, b1 = b
+            separation = abs(la - lb)
+            if not 2 <= separation <= max(16.0, 1.5 * med_t):
+                continue
+            s0, s1 = int(max(a0, b0)), int(min(a1, b1))
+            width = s1 - s0
+            if width < min_len or width > p.max_opening_px:
+                continue
+            if width < 0.6 * min(a1 - a0, b1 - b0):
+                continue
+            line = int(round((la + lb) / 2))
+            mid = (s0 + s1) // 2
+            px, py = (mid, line) if orient == "h" else (line, mid)
+            if not (0 <= py < fp.shape[0] and 0 <= px < fp.shape[1]) or fp[py, px] == 0:
+                continue
+            if distance[py, px] > max(13.0, med_t + 4.0):
+                continue
+            o = Opening("window", orient, line, s0, s1, med_t, 0.65)
+            wall_radius = max(4, int(round(1.5 * med_t)))
+            if _opening_band(wall, o, wall_radius).mean() > 0.12:
+                continue
+            raw.append(o)
+
+    found: List[Opening] = []
+    for o in sorted(raw, key=lambda v: -v.width):
+        if any(overlaps(o, other) for other in existing) or any(overlaps(o, other) for other in found):
+            continue
+        found.append(o)
+
+    # Hough 会在窗扇/中梃两侧给出短段；仅跨过非实心的小间隙合并。
+    merged: List[Opening] = []
+    for o in sorted(found, key=lambda v: (v.orient, v.line, v.s0, -v.width)):
+        if merged:
+            prev = merged[-1]
+            gap = o.s0 - prev.s1
+            if (prev.orient == o.orient and abs(prev.line - o.line) <= max(4.0, med_t / 2)
+                    and gap <= 2 * med_t
+                    and max(prev.s1, o.s1) - min(prev.s0, o.s0) <= p.max_opening_px):
+                if gap > 0:
+                    bridge = Opening("window", o.orient, prev.line, prev.s1, o.s0, med_t)
+                    if _opening_band(wall, bridge, max(2, int(round(med_t / 2)))).mean() > 0.12:
+                        merged.append(o)
+                        continue
+                prev.line = int(round((prev.line + o.line) / 2))
+                prev.s0, prev.s1 = min(prev.s0, o.s0), max(prev.s1, o.s1)
+                continue
+        merged.append(o)
+    return merged
 
 
 def classify_openings(ops: List[Opening], fp: np.ndarray, ink: np.ndarray,
                       p, mm_per_px: Optional[float] = None) -> List[Opening]:
-    """按 临外墙 / 洞宽 / 符号特征 区分 窗、门、开敞洞口。"""
-    edge = cv2.morphologyEx(fp, cv2.MORPH_GRADIENT,
-                            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9)))
+    """按外墙距离、洞宽和窗框平行线区分窗、门、开敞洞口。"""
+    distance = cv2.distanceTransform((fp > 0).astype(np.uint8), cv2.DIST_L2, 5)
     out: List[Opening] = []
     for o in ops:
         mx = (o.s0 + o.s1) // 2
         px, py = (mx, o.line) if o.orient == "h" else (o.line, mx)
         if not (0 <= py < fp.shape[0] and 0 <= px < fp.shape[1]) or fp[py, px] == 0:
             continue
-        on_edge = edge[max(0, py - 4):py + 5, max(0, px - 4):px + 5].sum() > 0
+        center_distance = float(distance[py, px])
+        on_edge = center_distance <= max(13.0, o.thickness + 4.0)
         w_mm = o.width * (mm_per_px or 0.0)
         if w_mm and w_mm < 350:
             continue                     # 太窄，是墙体缺口而非门窗
         wide = (w_mm > p.max_opening_mm) if mm_per_px else (o.width > 90)
-        # 沿墙线取一条 5px 高的带子：窗有玻璃线贯穿（密度高），门洞是空的（密度低）
-        if o.orient == "h":
-            band = ink[max(0, o.line - 2):o.line + 3, o.s0:o.s1]
-        else:
-            band = ink[o.s0:o.s1, max(0, o.line - 2):o.line + 3]
-        density = float(band.mean()) if band.size else 0.0
-        if wide:
+
+        center_band = _opening_band(ink, o, 2)
+        density = float(center_band.mean()) if center_band.size else 0.0
+        # 整个洞口仍然实心，通常是矢量化在 T 形交点留下的假缺口。
+        if density > 0.92:
+            continue
+        radius = max(4, int(round(o.thickness / 2)) + 3)
+        band = _opening_band(ink, o, radius)
+        line_clusters = _parallel_line_clusters(band, o.orient)
+
+        # 凸窗的玻璃线可能在墙中心之外；只在靠近外轮廓时扩大搜索范围。
+        if line_clusters < 2 and not on_edge and center_distance <= max(24.0, 4 * o.thickness):
+            bay_band = _opening_band(ink, o, max(radius, int(round(3 * o.thickness))))
+            line_clusters = max(line_clusters, _parallel_line_clusters(bay_band, o.orient))
+        has_window_symbol = line_clusters >= 2
+        is_window = has_window_symbol or (on_edge and density > 0.28)
+
+        if is_window:
+            typ, conf = "window", 0.9 if on_edge else 0.75
+        elif wide:
             typ, conf = "opening", 0.55
-        elif density > 0.28:
-            typ, conf = "window", 0.85 if on_edge else 0.7
         else:
-            typ, conf = "door", 0.85 if not on_edge else 0.7
-        if typ == "window" and on_edge:
-            conf = min(0.95, conf + 0.05)
+            typ, conf = "door", 0.7 if on_edge else 0.85
         o.type, o.confidence = typ, round(conf, 2)
         out.append(o)
     return out

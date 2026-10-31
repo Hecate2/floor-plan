@@ -46,7 +46,7 @@ def _clean(text: str) -> str:
     groups = re.findall(r"\d+(?:[.,]\d+)?", t)
     if len(groups) > 1:
         return ""
-    t = re.sub(r"[^0-9A-Za-z\u4e00-\u9fff.]", "", t)
+    t = re.sub(r"[^0-9A-Za-z\u4e00-\u9fff.,]", "", t)
     return re.sub(r"[mM]+$", "", t)
 
 
@@ -149,14 +149,33 @@ def ocr(gray: np.ndarray, backend: str = "auto") -> List[Token]:
     return ocr_tesseract(gray)
 
 
-def ocr_with_rotation(gray: np.ndarray, backend: str = "auto"):
-    """返回 (tokens, 竖排补充 tokens)。
+def _merge_tokens(a: List[Token], b: List[Token]) -> List[Token]:
+    """合并两个 OCR 后端的结果；同文本且中心基本重合时保留高置信度。"""
+    out = list(a)
+    for t in b:
+        duplicate = False
+        for i, old in enumerate(out):
+            if old.text != t.text:
+                continue
+            tol = max(6.0, 0.5 * min(old.w + old.h, t.w + t.h))
+            if abs(old.cx - t.cx) <= tol and abs(old.cy - t.cy) <= tol:
+                if t.conf > old.conf:
+                    out[i] = t
+                duplicate = True
+                break
+        if not duplicate:
+            out.append(t)
+    return out
 
-    RapidOCR 自带方向检测，竖排文字直接可读；tesseract 则需再跑一遍旋转图。
-    """
-    toks = ocr(gray, backend)
-    if backend == "auto" and _get_rapid():
-        return toks, []
+
+def ocr_with_rotation(gray: np.ndarray, backend: str = "auto"):
+    """返回 (tokens, 竖排补充 tokens)。自动模式融合 RapidOCR 与 tesseract。"""
+    if backend == "rapidocr":
+        return ocr_rapid(gray), []
+
+    toks = ocr_tesseract(gray)
+    if backend == "auto":
+        toks = _merge_tokens(ocr_rapid(gray), toks)
     rot = np.rot90(gray, k=-1)                     # 顺时针 90°
     h, w = gray.shape
     mapped: List[Token] = []
@@ -164,4 +183,4 @@ def ocr_with_rotation(gray: np.ndarray, backend: str = "auto"):
         cx, cy = t.cx, t.cy                        # R[i, j] = gray[h-1-j, i]
         nx, ny = int(round(cy)), int(round(h - 1 - cx))
         mapped.append(Token(t.text, t.conf, nx - t.h // 2, ny - t.w // 2, t.h, t.w))
-    return toks, mapped
+    return _merge_tokens(toks, mapped), []
