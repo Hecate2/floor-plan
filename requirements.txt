@@ -1,0 +1,8 @@
+# 核心
+numpy>=1.26
+opencv-python-headless==4.11.0.86   # 5.0 预构建版对 int32/bool 的形态学支持有问题
+pillow>=10.0
+
+# OCR（二选一；RapidOCR 支持中文+竖排，推荐）
+rapidocr-onnxruntime>=1.3
+# pytesseract 走系统 tesseract，仅在需要 chi_sim 且未装 RapidOCR 时使用
